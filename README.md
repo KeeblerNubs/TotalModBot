@@ -48,6 +48,38 @@ You can override the following environment variables in `.env` or when starting 
 | `DATA_DIR`  | Optional. Directory for persistent JSON state inside the container. Defaults to `/app/data`. |
 | `DATA_FILE` | Optional. Custom JSON file path for persistent state. Defaults to `<DATA_DIR>/mod_data.json`. |
 
+## Role-based permission model
+
+TotalModBot supports eight access levels that govern who can run each moderation command. User IDs listed in the `ADMINS` environment variable start as **Super Admins**; you can promote or demote other users at runtime with `/promote` and `/demote` (numeric Telegram IDs only).
+
+| Feature/Command | Super Admin | KB Admin | KB Limited Admin | KB Moderator | KB Lead | Protected | Local Admin | Non-Admin |
+|-----------------|:-----------:|:--------:|:----------------:|:------------:|:-------:|:---------:|:-----------:|:---------:|
+| **Role Management** | | | | | | | | |
+| `/promote` | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| `/demote` | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| `/listroles` | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| **Protection Management** | | | | | | | | |
+| `/getprotected` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
+| `/getleader` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
+| **Ban Operations** | | | | | | | | |
+| `/ban` (default scope) | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ |
+| `/ban --any` | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| `/unban` (default scope) | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ |
+| `/unban --any` | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| `/globalban` | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| `/globalunban` | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| `/gbanned` | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| **Data & System** | | | | | | | | |
+| `/getadmins` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
+| `/health` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `/getid` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Monitoring** | | | | | | | | |
+| `/monitoring` | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| `/monitor` | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ |
+| `/watch` | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
+
+*Default scope* for `/ban` and `/unban` applies to the chat where the command is issued. Adding `--any` attempts the action across every managed chat. Use `/register` and `/unregister` to control which chat IDs are in the managed list.
+
 ## Development without Docker (optional)
 
 If you prefer running the bot directly on your machine:
