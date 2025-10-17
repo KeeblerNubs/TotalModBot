@@ -2,6 +2,14 @@
 
 TotalModBot is a simple Telegram moderation bot that lets trusted admins manage a shared ban list across multiple groups. It uses long polling via `python-telegram-bot` v20.
 
+## Features
+
+- Register chats the bot should manage and keep a shared global ban list.
+- Apply single, forced, or mass bans that automatically sync across all managed chats.
+- Maintain an allow-list of protected users who cannot be banned by accident.
+- Track ban activity and display KickBot-style statistics with `/stats`.
+- Quickly look up user IDs, review protected users, and inspect your own role via commands like `/getid`, `/getprotected`, and `/roles`.
+
 ## Prerequisites
 
 - A Telegram bot token from [BotFather](https://core.telegram.org/bots#botfather).
@@ -47,6 +55,26 @@ You can override the following environment variables in `.env` or when starting 
 | `LOG_LEVEL` | Optional. Python logging level (e.g. `INFO`, `DEBUG`). Defaults to `INFO`. |
 | `DATA_DIR`  | Optional. Directory for persistent JSON state inside the container. Defaults to `/app/data`. |
 | `DATA_FILE` | Optional. Custom JSON file path for persistent state. Defaults to `<DATA_DIR>/mod_data.json`. |
+
+## Commands
+
+| Command | Description |
+|---------|-------------|
+| `/start` | Show a basic introduction and available admin commands. |
+| `/help` | Display the quick command reference. |
+| `/register` / `/unregister` | Add or remove the current chat from the managed list. |
+| `/list_managed` | List all chats that will receive ban updates. |
+| `/ban` | Globally ban a single user across all managed chats. |
+| `/fban` | Apply a "forced" ban that is marked as permanent in the logs. |
+| `/mban` | Ban multiple users in one command. |
+| `/globalban` | Legacy alias for `/ban`. |
+| `/unban` | Remove a user from the global ban list (requires a reason). |
+| `/globalunban` | Legacy alias for `/unban` without the reason requirement. |
+| `/protect` / `/unprotect` | Add or remove users from the protected allow-list. |
+| `/getprotected` | Show all protected users. |
+| `/stats` | Display KickBot-styled statistics including ban counts. |
+| `/getid` | Resolve a Telegram ID for a username or replied user. |
+| `/roles` | Reveal whether you are a configured Super Admin. |
 
 ## Development without Docker (optional)
 
