@@ -2,6 +2,15 @@
 
 TotalModBot is a simple Telegram moderation bot that lets trusted admins manage a shared ban list across multiple groups. It uses long polling via `python-telegram-bot` v20.
 
+## Commands
+
+- `/register` – mark the current chat as managed so it receives global ban updates.
+- `/unregister` – remove the current chat from the managed list.
+- `/ban` – ban a user from the current chat (reply to a message or pass a username/user ID and optional reason).
+- `/globalban` – add a user to the shared global ban list and attempt to ban them from all managed chats.
+- `/globalunban` – remove a user from the shared global ban list and unban them from managed chats where possible.
+- `/list_managed` – show the chats currently registered with the bot.
+
 ## Prerequisites
 
 - A Telegram bot token from [BotFather](https://core.telegram.org/bots#botfather).

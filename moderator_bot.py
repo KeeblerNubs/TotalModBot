@@ -104,6 +104,60 @@ async def list_managed(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines = [f"{i+1}. id={cid}" for i, cid in enumerate(data["managed_chats"])]
     await ctx.bot.send_message(update.effective_chat.id, "Managed chats:\n" + "\n".join(lines))
 
+
+async def ban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    issuer = update.effective_user
+    chat = update.effective_chat
+
+    if not await is_admin_user(issuer.id):
+        await ctx.bot.send_message(chat.id, "You do not have permission to use /ban.")
+        return
+
+    target_id = None
+    target_label = None
+
+    if message and message.reply_to_message and message.reply_to_message.from_user:
+        target_user = message.reply_to_message.from_user
+        target_id = target_user.id
+        target_label = f"{target_user.full_name} ({target_user.id})"
+        reason = " ".join(ctx.args).strip() or "No reason provided"
+    elif ctx.args:
+        target_arg = ctx.args[0]
+        reason = " ".join(ctx.args[1:]).strip() or "No reason provided"
+        parsed = parse_target_arg(target_arg)
+
+        if parsed is None:
+            await ctx.bot.send_message(chat.id,
+                                       "❌ Invalid Usage\n\nPlease specify a user to target.\n\nUsage:\n• Reply: /ban <reason>\n• Username: /ban @username <reason>\n• User ID: /ban user_id <reason>")
+            return
+
+        if isinstance(parsed, str) and parsed.startswith("@"):
+            try:
+                chat_obj = await ctx.bot.get_chat(parsed)
+            except Exception as exc:  # pragma: no cover - network failure surface
+                logger.warning("Failed to resolve username %s: %s", parsed, exc)
+                await ctx.bot.send_message(chat.id, f"Could not resolve username {parsed}.")
+                return
+            target_id = chat_obj.id
+            display_name = chat_obj.full_name or chat_obj.username or parsed
+            target_label = f"{display_name} ({target_id})"
+        else:
+            target_id = parsed
+            target_label = str(parsed)
+    else:
+        await ctx.bot.send_message(chat.id,
+                                   "❌ Invalid Usage\n\nPlease specify a user to target.\n\nUsage:\n• Reply: /ban <reason>\n• Username: /ban @username <reason>\n• User ID: /ban user_id <reason>")
+        return
+
+    try:
+        await ctx.bot.ban_chat_member(chat.id, target_id)
+        await ctx.bot.send_message(chat.id, f"Banned {target_label}. Reason: {reason}")
+    except Exception as exc:  # pragma: no cover - network failure surface
+        logger.exception("Failed to ban user %s in chat %s", target_id, chat.id)
+        await ctx.bot.send_message(chat.id, f"Failed to ban user: {exc}")
+
+
 # helper to resolve a username or user_id from args
 def parse_target_arg(arg: str):
     # accept @username or numeric id
@@ -202,7 +256,7 @@ async def globalunban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # simple start
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await ctx.bot.send_message(update.effective_chat.id,
-                               "Moderation bot online. Admin commands: /register /unregister /globalban /globalunban /list_managed.")
+                               "Moderation bot online. Admin commands: /register /unregister /ban /globalban /globalunban /list_managed.")
 
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -211,6 +265,7 @@ def main():
     app.add_handler(CommandHandler("register", register))
     app.add_handler(CommandHandler("unregister", unregister))
     app.add_handler(CommandHandler("list_managed", list_managed))
+    app.add_handler(CommandHandler("ban", ban))
     app.add_handler(CommandHandler("globalban", globalban))
     app.add_handler(CommandHandler("globalunban", globalunban))
 
