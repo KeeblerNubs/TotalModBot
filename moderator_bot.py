@@ -1,15 +1,22 @@
-# moderator_bot.py
+"""Telegram moderation bot with KickBot-style commands."""
+from __future__ import annotations
+
+import asyncio
 import json
 import logging
 import os
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import date, datetime, timezone
+from functools import wraps
+from typing import Any, Optional
 
 from telegram import Update
+from telegram.error import TelegramError
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # ---------- CONFIG ----------
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "<PUT_YOUR_TOKEN_HERE>")
-DEFAULT_ADMINS = {123456789}  # set of ints
+DEFAULT_ADMINS = {123456789}
 DATA_DIR = os.environ.get("DATA_DIR", os.path.join(os.getcwd(), "data"))
 DATA_FILE = os.environ.get("DATA_FILE", os.path.join(DATA_DIR, "mod_data.json"))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
@@ -21,11 +28,11 @@ logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
 logger = logging.getLogger(__name__)
 
 
-def _parse_admins(value: str | None):
+def _parse_admins(value: Optional[str]) -> set[int]:
     if not value:
-        return DEFAULT_ADMINS
-    admins = set()
-    invalid_values = []
+        return set(DEFAULT_ADMINS)
+    admins: set[int] = set()
+    invalid_values: list[str] = []
     for part in value.replace(";", ",").split(","):
         part = part.strip()
         if not part:
@@ -36,96 +43,606 @@ def _parse_admins(value: str | None):
             invalid_values.append(part)
     if invalid_values:
         logger.warning("Ignoring invalid ADMINS entries: %s", ", ".join(invalid_values))
-    return admins or DEFAULT_ADMINS
+    return admins or set(DEFAULT_ADMINS)
 
 
 ADMINS = _parse_admins(os.environ.get("ADMINS"))
 logger.info("Admin IDs configured: %s", sorted(ADMINS))
 logger.info("Persisting moderation data at %s", DATA_FILE)
 
-# persistent storage helpers
-def _ensure_data_schema(loaded: dict | None) -> dict:
-    base = loaded or {}
-    base.setdefault("managed_chats", [])
-    base.setdefault("global_bans", [])
-    base.setdefault("protected_users", [])
-    base.setdefault("ban_logs", [])
+
+@dataclass
+class Target:
+    raw: str
+    user_id: Optional[int]
+    label: str
+    from_reply: bool = False
+    consumed_args: int = 0
+
+
+_data_lock = asyncio.Lock()
+
+
+def _normalize_key(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip().lower()
+    return str(value).strip().lower()
+
+
+def _utcnow_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _ensure_schema(raw: Optional[dict[str, Any]]) -> dict[str, Any]:
+    base: dict[str, Any] = raw or {}
+    managed = base.get("managed_chats", [])
+    if not isinstance(managed, list):
+        managed = []
+    # store as unique ints preserving order
+    unique_managed: list[int] = []
+    for item in managed:
+        try:
+            cid = int(item)
+        except (TypeError, ValueError):
+            continue
+        if cid not in unique_managed:
+            unique_managed.append(cid)
+    base["managed_chats"] = unique_managed
+
+    protected = base.get("protected_users", [])
+    if not isinstance(protected, list):
+        protected = []
+    cleaned_protected: list[Any] = []
+    seen_keys: set[str] = set()
+    for entry in protected:
+        key = _normalize_key(entry)
+        if key not in seen_keys:
+            cleaned_protected.append(entry)
+            seen_keys.add(key)
+    base["protected_users"] = cleaned_protected
+
+    bans = base.get("global_bans", [])
+    if not isinstance(bans, list):
+        bans = []
+    cleaned_bans: list[dict[str, Any]] = []
+    for entry in bans:
+        if isinstance(entry, dict):
+            target = entry.get("target")
+            if not target:
+                continue
+            id_key = entry.get("id_key")
+            if id_key is not None:
+                id_key = _normalize_key(id_key)
+            cleaned_bans.append(
+                {
+                    "target": str(target),
+                    "key": entry.get("key", _normalize_key(target)),
+                    "reason": entry.get("reason", "No reason provided."),
+                    "issuer": entry.get("issuer"),
+                    "permanent": bool(entry.get("permanent", False)),
+                    "timestamp": entry.get("timestamp", _utcnow_iso()),
+                    "id_key": id_key,
+                }
+            )
+        elif isinstance(entry, str):
+            cleaned_bans.append(
+                {
+                    "target": entry,
+                    "key": _normalize_key(entry),
+                    "reason": "No reason provided.",
+                    "issuer": None,
+                    "permanent": False,
+                    "timestamp": _utcnow_iso(),
+                    "id_key": None,
+                }
+            )
+    base["global_bans"] = cleaned_bans
+
+    logs = base.get("ban_logs", [])
+    if not isinstance(logs, list):
+        logs = []
+    cleaned_logs: list[dict[str, Any]] = []
+    for entry in logs:
+        if not isinstance(entry, dict):
+            continue
+        action = entry.get("action", "ban")
+        cleaned_logs.append(
+            {
+                "action": action,
+                "target": str(entry.get("target")),
+                "issuer": entry.get("issuer"),
+                "reason": entry.get("reason", ""),
+                "permanent": bool(entry.get("permanent", False)),
+                "timestamp": entry.get("timestamp", _utcnow_iso()),
+            }
+        )
+    base["ban_logs"] = cleaned_logs
     return base
 
 
-def load_data():
+def load_data() -> dict[str, Any]:
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return _ensure_data_schema(json.load(f))
-    return _ensure_data_schema(None)
+            return _ensure_schema(json.load(f))
+    return _ensure_schema(None)
 
-def save_data(data):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
+
+def save_data(data: dict[str, Any]) -> None:
+    tmp_path = f"{DATA_FILE}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
+    os.replace(tmp_path, DATA_FILE)
+
 
 data = load_data()
 
 
-def _normalize_key(value: str | int) -> str:
-    if isinstance(value, str):
-        return value.lower()
-    return str(value)
-
-
-def _get_global_ban_entry(target_arg: str):
+def _find_ban_entry(key: str) -> Optional[dict[str, Any]]:
+    normalized = _normalize_key(key)
     for entry in data["global_bans"]:
-        if isinstance(entry, dict) and entry.get("target") == target_arg:
+        if entry.get("key") == normalized:
             return entry
-        if isinstance(entry, str) and entry == target_arg:
+        id_key = entry.get("id_key")
+        if id_key is not None and id_key == normalized:
             return entry
     return None
 
 
-def _remove_global_ban_entry(target_arg: str):
-    entry = _get_global_ban_entry(target_arg)
-    if entry is not None:
-        data["global_bans"].remove(entry)
-    return entry
+def _is_protected(target: Target | str | int) -> bool:
+    key = _normalize_key(target.raw if isinstance(target, Target) else target)
+    return any(_normalize_key(item) == key for item in data["protected_users"])
 
 
-def _is_protected(target_arg: str | int) -> bool:
-    normalized = _normalize_key(target_arg)
-    return any(_normalize_key(item) == normalized for item in data["protected_users"])
-
-
-def _add_protected(target_arg: str | int):
-    normalized = _normalize_key(target_arg)
-    if not any(_normalize_key(item) == normalized for item in data["protected_users"]):
-        data["protected_users"].append(target_arg)
-
-
-def _remove_protected(target_arg: str | int) -> bool:
-    normalized = _normalize_key(target_arg)
-    for item in list(data["protected_users"]):
-        if _normalize_key(item) == normalized:
-            data["protected_users"].remove(item)
-            return True
-    return False
-
-
-def _record_ban_log(target_arg: str, issuer_id: int, reason: str, permanent: bool):
+def _record_log(action: str, target: str, issuer: Optional[int], reason: str, *, permanent: bool = False) -> None:
     data["ban_logs"].append(
         {
-            "target": target_arg,
-            "issuer": issuer_id,
+            "action": action,
+            "target": target,
+            "issuer": issuer,
             "reason": reason,
             "permanent": permanent,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": _utcnow_iso(),
         }
     )
 
 
-def _date_from_timestamp(value: str | None):
-    if not value:
+def _extract_reason(
+    ctx: ContextTypes.DEFAULT_TYPE,
+    target: Target,
+    *,
+    default: str,
+    require: bool,
+) -> Optional[str]:
+    tokens: list[str]
+    if target.from_reply:
+        tokens = ctx.args
+    else:
+        tokens = ctx.args[target.consumed_args :]
+    reason = " ".join(tokens).strip()
+    if not reason:
+        if require:
+            return None
+        return default
+    return reason
+
+
+def admin_only(handler):
+    @wraps(handler)
+    async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        user = update.effective_user
+        chat = update.effective_chat
+        if not user or user.id not in ADMINS:
+            if chat:
+                await ctx.bot.send_message(chat.id, "You are not authorized to run that command.")
+            return
+        return await handler(update, ctx, *args, **kwargs)
+    return wrapper
+
+
+async def _resolve_target_from_args(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Optional[Target]:
+    message = update.effective_message
+    raw: Optional[str] = None
+    label_hint: Optional[str] = None
+    user_hint: Optional[int] = None
+    from_reply = False
+
+    if ctx.args:
+        raw = ctx.args[0]
+        consumed = 1
+    elif message and message.reply_to_message and message.reply_to_message.from_user:
+        replied = message.reply_to_message.from_user
+        raw = str(replied.id)
+        label_hint = f"{replied.full_name} ({replied.id})"
+        user_hint = replied.id
+        from_reply = True
+        consumed = 0
+    if raw is None:
         return None
+
+    return await _resolve_target_from_value(
+        update,
+        ctx,
+        raw,
+        label_hint=label_hint,
+        user_hint=user_hint,
+        from_reply=from_reply,
+        consumed_args=consumed,
+    )
+
+
+async def _resolve_target_from_value(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    raw_value: str,
+    *,
+    label_hint: Optional[str] = None,
+    user_hint: Optional[int] = None,
+    from_reply: bool = False,
+    consumed_args: int = 1,
+) -> Optional[Target]:
+    raw_value = raw_value.strip()
+    if not raw_value:
+        return None
+
+    label = label_hint or raw_value
+    user_id = user_hint
+
+    if raw_value.startswith("@"):
+        try:
+            chat_obj = await ctx.bot.get_chat(raw_value)
+            user_id = chat_obj.id
+            display = chat_obj.full_name or chat_obj.username or raw_value
+            label = f"{display} ({raw_value})"
+        except TelegramError as exc:
+            logger.warning("Failed to resolve username %s: %s", raw_value, exc)
+    else:
+        try:
+            user_id = int(raw_value)
+            label = f"User {user_id}"
+        except ValueError:
+            pass
+
+    return Target(raw=raw_value, user_id=user_id, label=label, from_reply=from_reply, consumed_args=consumed_args)
+
+
+async def _propagate_ban(ctx: ContextTypes.DEFAULT_TYPE, target: Target) -> list[str]:
+    if not data["managed_chats"]:
+        return ["No managed chats registered; nothing to sync."]
+
+    results: list[str] = []
+    try:
+        bot_user = await ctx.bot.get_me()
+    except TelegramError:
+        bot_user = None
+
+    for cid in list(data["managed_chats"]):
+        try:
+            if bot_user is not None:
+                bot_member = await ctx.bot.get_chat_member(cid, bot_user.id)
+                can_restrict = getattr(bot_member, "can_restrict_members", False)
+                if bot_member.status not in ("administrator", "creator") or not can_restrict:
+                    results.append(f"Chat {cid}: missing ban permission.")
+                    continue
+            if target.user_id is None:
+                results.append(f"Chat {cid}: skipped (could not resolve user ID for {target.raw}).")
+                continue
+            await ctx.bot.ban_chat_member(cid, target.user_id)
+            results.append(f"Chat {cid}: banned {target.raw}.")
+        except TelegramError as exc:
+            logger.warning("Failed to ban %s in chat %s: %s", target.raw, cid, exc)
+            results.append(f"Chat {cid}: failed to ban ({exc}).")
+    return results
+
+
+async def _propagate_unban(ctx: ContextTypes.DEFAULT_TYPE, target: Target) -> list[str]:
+    if not data["managed_chats"]:
+        return ["No managed chats registered; nothing to sync."]
+
+    results: list[str] = []
+    try:
+        bot_user = await ctx.bot.get_me()
+    except TelegramError:
+        bot_user = None
+
+    for cid in list(data["managed_chats"]):
+        try:
+            if bot_user is not None:
+                bot_member = await ctx.bot.get_chat_member(cid, bot_user.id)
+                can_restrict = getattr(bot_member, "can_restrict_members", False)
+                if bot_member.status not in ("administrator", "creator") or not can_restrict:
+                    results.append(f"Chat {cid}: missing unban permission.")
+                    continue
+            if target.user_id is None:
+                results.append(f"Chat {cid}: skipped (could not resolve user ID for {target.raw}).")
+                continue
+            await ctx.bot.unban_chat_member(cid, target.user_id)
+            results.append(f"Chat {cid}: unbanned {target.raw}.")
+        except TelegramError as exc:
+            logger.warning("Failed to unban %s in chat %s: %s", target.raw, cid, exc)
+            results.append(f"Chat {cid}: failed to unban ({exc}).")
+    return results
+
+
+async def _handle_single_ban(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    target: Target,
+    issuer_id: int,
+    reason: str,
+    permanent: bool,
+) -> str:
+    async with _data_lock:
+        if _is_protected(target):
+            return f"{target.raw} is protected and cannot be banned."
+        existing = _find_ban_entry(target.raw)
+        if existing:
+            return f"{target.raw} is already globally banned."
+
+        entry = {
+            "target": target.raw,
+            "key": _normalize_key(target.raw),
+            "reason": reason,
+            "issuer": issuer_id,
+            "permanent": permanent,
+            "timestamp": _utcnow_iso(),
+            "id_key": _normalize_key(str(target.user_id)) if target.user_id is not None else None,
+        }
+        data["global_bans"].append(entry)
+        _record_log("ban", target.raw, issuer_id, reason, permanent=permanent)
+        save_data(data)
+
+    results = await _propagate_ban(ctx, target)
+    summary_lines = [f"Global ban applied to {target.label}.", f"Reason: {reason}"]
+    if permanent:
+        summary_lines.append("Flagged as permanent ban.")
+    summary_lines.append("")
+    summary_lines.extend(results)
+    return "\n".join(summary_lines)
+
+
+@admin_only
+async def register(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if chat is None:
+        return
+    async with _data_lock:
+        if chat.id in data["managed_chats"]:
+            await ctx.bot.send_message(chat.id, "This chat is already managed.")
+            return
+        data["managed_chats"].append(chat.id)
+        save_data(data)
+    await ctx.bot.send_message(chat.id, f"Registered this chat (id={chat.id}) for global moderation.")
+
+
+@admin_only
+async def unregister(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if chat is None:
+        return
+    async with _data_lock:
+        if chat.id not in data["managed_chats"]:
+            await ctx.bot.send_message(chat.id, "This chat is not managed.")
+            return
+        data["managed_chats"].remove(chat.id)
+        save_data(data)
+    await ctx.bot.send_message(chat.id, f"Unregistered this chat (id={chat.id}).")
+
+
+@admin_only
+async def list_managed(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if chat is None:
+        return
+    async with _data_lock:
+        managed = list(data["managed_chats"])
+    if not managed:
+        await ctx.bot.send_message(chat.id, "No managed chats registered.")
+        return
+    lines = [f"{index + 1}. {cid}" for index, cid in enumerate(managed)]
+    await ctx.bot.send_message(chat.id, "Managed chats:\n" + "\n".join(lines))
+
+
+@admin_only
+async def ban(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if not chat:
+        return
+    if not ctx.args and not (update.effective_message and update.effective_message.reply_to_message):
+        await ctx.bot.send_message(chat.id, "Usage: /ban <user_id|@username> [reason]")
+        return
+    target = await _resolve_target_from_args(update, ctx)
+    if not target:
+        await ctx.bot.send_message(chat.id, "Could not determine a target user.")
+        return
+    reason = _extract_reason(ctx, target, default="No reason provided.", require=False)
+    issuer = update.effective_user.id
+    message = await _handle_single_ban(update, ctx, target=target, issuer_id=issuer, reason=reason, permanent=False)
+    await ctx.bot.send_message(chat.id, message)
+
+
+@admin_only
+async def fban(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if not chat:
+        return
+    if not ctx.args and not (update.effective_message and update.effective_message.reply_to_message):
+        await ctx.bot.send_message(chat.id, "Usage: /fban <user_id|@username> [reason]")
+        return
+    target = await _resolve_target_from_args(update, ctx)
+    if not target:
+        await ctx.bot.send_message(chat.id, "Could not determine a target user.")
+        return
+    reason = _extract_reason(ctx, target, default="No reason provided.", require=False)
+    issuer = update.effective_user.id
+    message = await _handle_single_ban(update, ctx, target=target, issuer_id=issuer, reason=reason, permanent=True)
+    await ctx.bot.send_message(chat.id, message)
+
+
+def _split_mass_ban_args(args: list[str]) -> tuple[list[str], str]:
+    if "--" in args:
+        idx = args.index("--")
+        targets = args[:idx]
+        reason = " ".join(args[idx + 1 :]).strip()
+    else:
+        targets = args
+        reason = "Mass ban issued."
+    return targets, reason or "Mass ban issued."
+
+
+@admin_only
+async def mban(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if not chat:
+        return
+    if not ctx.args or len(ctx.args) < 2 and "--" not in ctx.args:
+        await ctx.bot.send_message(chat.id, "Usage: /mban <user1> <user2> [...] -- <reason>")
+        return
+    raw_targets, reason = _split_mass_ban_args(ctx.args)
+    if not raw_targets:
+        await ctx.bot.send_message(chat.id, "Usage: /mban <user1> <user2> [...] -- <reason>")
+        return
+
+    issuer_id = update.effective_user.id
+    results: list[str] = []
+    for raw in raw_targets:
+        target = await _resolve_target_from_value(update, ctx, raw)
+        if not target:
+            results.append(f"{raw}: could not resolve target.")
+            continue
+        message = await _handle_single_ban(update, ctx, target=target, issuer_id=issuer_id, reason=reason, permanent=False)
+        results.append(message)
+    await ctx.bot.send_message(chat.id, "\n\n".join(results))
+
+
+async def _handle_unban(
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    *,
+    target: Target,
+    issuer_id: int,
+    reason: str,
+) -> str:
+    async with _data_lock:
+        entry = _find_ban_entry(target.raw)
+        if not entry:
+            return f"{target.raw} is not globally banned."
+        if target.user_id is None and entry.get("id_key"):
+            try:
+                target.user_id = int(entry["id_key"])
+            except ValueError:
+                target.user_id = None
+        data["global_bans"].remove(entry)
+        _record_log("unban", target.raw, issuer_id, reason)
+        save_data(data)
+    results = await _propagate_unban(ctx, target)
+    summary_lines = [f"Removed {target.label} from the global ban list.", f"Reason: {reason}", ""]
+    summary_lines.extend(results)
+    return "\n".join(summary_lines)
+
+
+@admin_only
+async def unban(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if not chat:
+        return
+    if not ctx.args and not (update.effective_message and update.effective_message.reply_to_message):
+        await ctx.bot.send_message(chat.id, "Usage: /unban <user_id|@username> <reason>")
+        return
+    target = await _resolve_target_from_args(update, ctx)
+    if not target:
+        await ctx.bot.send_message(chat.id, "Could not determine a target user.")
+        return
+    reason = _extract_reason(ctx, target, default="", require=True)
+    if reason is None:
+        await ctx.bot.send_message(chat.id, "Unban requires a reason. Usage: /unban <user> <reason>")
+        return
+    issuer = update.effective_user.id
+    message = await _handle_unban(update, ctx, target=target, issuer_id=issuer, reason=reason)
+    await ctx.bot.send_message(chat.id, message)
+
+
+@admin_only
+async def globalunban(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if not chat:
+        return
+    if not ctx.args and not (update.effective_message and update.effective_message.reply_to_message):
+        await ctx.bot.send_message(chat.id, "Usage: /globalunban <user_id|@username> [reason]")
+        return
+    target = await _resolve_target_from_args(update, ctx)
+    if not target:
+        await ctx.bot.send_message(chat.id, "Could not determine a target user.")
+        return
+    reason = _extract_reason(ctx, target, default="No reason provided.", require=False)
+    issuer = update.effective_user.id
+    message = await _handle_unban(update, ctx, target=target, issuer_id=issuer, reason=reason)
+    await ctx.bot.send_message(chat.id, message)
+
+
+@admin_only
+async def protect(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if not chat:
+        return
+    if not ctx.args and not (update.effective_message and update.effective_message.reply_to_message):
+        await ctx.bot.send_message(chat.id, "Usage: /protect <user_id|@username>")
+        return
+    target = await _resolve_target_from_args(update, ctx)
+    if not target:
+        await ctx.bot.send_message(chat.id, "Could not determine a target user.")
+        return
+    async with _data_lock:
+        key = _normalize_key(target.raw)
+        if any(_normalize_key(item) == key for item in data["protected_users"]):
+            await ctx.bot.send_message(chat.id, f"{target.raw} is already protected.")
+            return
+        data["protected_users"].append(target.raw)
+        save_data(data)
+    await ctx.bot.send_message(chat.id, f"Added {target.label} to the protected list.")
+
+
+@admin_only
+async def unprotect(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if not chat:
+        return
+    if not ctx.args and not (update.effective_message and update.effective_message.reply_to_message):
+        await ctx.bot.send_message(chat.id, "Usage: /unprotect <user_id|@username>")
+        return
+    target = await _resolve_target_from_args(update, ctx)
+    if not target:
+        await ctx.bot.send_message(chat.id, "Could not determine a target user.")
+        return
+    async with _data_lock:
+        key = _normalize_key(target.raw)
+        for entry in list(data["protected_users"]):
+            if _normalize_key(entry) == key:
+                data["protected_users"].remove(entry)
+                save_data(data)
+                await ctx.bot.send_message(chat.id, f"Removed {target.label} from the protected list.")
+                return
+    await ctx.bot.send_message(chat.id, f"{target.raw} was not protected.")
+
+
+@admin_only
+async def get_protected(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if not chat:
+        return
+    async with _data_lock:
+        protected = list(data["protected_users"])
+    if not protected:
+        await ctx.bot.send_message(chat.id, "No protected users configured.")
+        return
+    lines = [f"• {entry}" for entry in protected]
+    await ctx.bot.send_message(chat.id, "Protected users:\n" + "\n".join(lines))
+
+
+def _parse_iso_date(value: str) -> Optional[date]:
     try:
         dt = datetime.fromisoformat(value)
-    except ValueError:
+    except (TypeError, ValueError):
         return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
@@ -133,430 +650,144 @@ def _date_from_timestamp(value: str | None):
         dt = dt.astimezone(timezone.utc)
     return dt.date()
 
-async def is_admin_user(user_id: int) -> bool:
-    return user_id in ADMINS
 
-# register current chat as managed (only works in groups/channels)
-async def register(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
+@admin_only
+async def stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
-    if not await is_admin_user(user.id):
-        await ctx.bot.send_message(chat.id, "Only configured bot admins can register chats.")
+    if not chat:
         return
-
-    cid = chat.id
-    if cid in data["managed_chats"]:
-        await ctx.bot.send_message(chat.id, "This chat is already managed.")
-        return
-
-    data["managed_chats"].append(cid)
-    save_data(data)
-    await ctx.bot.send_message(chat.id, f"Registered this chat (id={cid}) as managed.")
-
-# unregister current chat
-async def unregister(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    chat = update.effective_chat
-    if not await is_admin_user(user.id):
-        await ctx.bot.send_message(chat.id, "Only configured bot admins can unregister chats.")
-        return
-
-    cid = chat.id
-    if cid not in data["managed_chats"]:
-        await ctx.bot.send_message(chat.id, "This chat is not managed.")
-        return
-
-    data["managed_chats"].remove(cid)
-    save_data(data)
-    await ctx.bot.send_message(chat.id, f"Unregistered this chat (id={cid}).")
-
-# list managed chats
-async def list_managed(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not await is_admin_user(user.id):
-        await ctx.bot.send_message(update.effective_chat.id, "Only configured bot admins can view this list.")
-        return
-    if not data["managed_chats"]:
-        await ctx.bot.send_message(update.effective_chat.id, "No managed chats.")
-        return
-    lines = [f"{i+1}. id={cid}" for i, cid in enumerate(data["managed_chats"])]
-    await ctx.bot.send_message(update.effective_chat.id, "Managed chats:\n" + "\n".join(lines))
-
-# helper to resolve a username or user_id from args
-def parse_target_arg(arg: str):
-    # accept @username or numeric id
-    if arg.startswith("@"):
-        return arg  # username string
-    try:
-        return int(arg)
-    except ValueError:
-        return None
-
-async def _resolve_target_id(ctx: ContextTypes.DEFAULT_TYPE, target):
-    if isinstance(target, str) and target.startswith("@"):
-        try:
-            chat_obj = await ctx.bot.get_chat(target)
-            return chat_obj.id
-        except Exception:
-            return None
-    return target
-
-
-async def _ensure_bot_can_ban(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int) -> bool:
-    try:
-        bot_member = await ctx.bot.get_chat_member(chat_id, (await ctx.bot.get_me()).id)
-    except Exception:
-        return False
-    return bot_member.status in ("administrator", "creator") and getattr(bot_member, "can_restrict_members", False)
-
-
-async def _apply_ban_to_chat(ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int, target_arg: str):
-    try:
-        if not await _ensure_bot_can_ban(ctx, chat_id):
-            return f"Chat {chat_id}: bot lacks ban permission — skipped."
-        await ctx.bot.ban_chat_member(chat_id, user_id)
-        return f"Chat {chat_id}: banned user {target_arg}."
-    except Exception as exc:
-        logger.exception("Ban failed for chat %s", chat_id)
-        return f"Chat {chat_id}: failed to ban ({exc})."
-
-
-async def _ban_targets(update: Update, ctx: ContextTypes.DEFAULT_TYPE, target_args: list[str], reason: str,
-                       permanent: bool):
-    issuer = update.effective_user
-    overall_results = []
-    for target_arg in target_args:
-        if _is_protected(target_arg):
-            overall_results.append(f"{target_arg}: is protected — skipped.")
-            continue
-
-        parsed = parse_target_arg(target_arg)
-        if parsed is None:
-            overall_results.append(f"{target_arg}: could not parse user id.")
-            continue
-
-        if _get_global_ban_entry(target_arg) is not None:
-            overall_results.append(f"{target_arg}: already globally banned.")
-            continue
-
-        resolved_id = await _resolve_target_id(ctx, parsed)
-        if resolved_id is None:
-            overall_results.append(f"{target_arg}: could not resolve user id.")
-            continue
-
-        entry = {
-            "target": target_arg,
-            "issuer": issuer.id,
-            "reason": reason,
-            "permanent": permanent,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-        data["global_bans"].append(entry)
-
-        chat_results = []
-        for cid in list(data["managed_chats"]):
-            chat_result = await _apply_ban_to_chat(ctx, cid, resolved_id, target_arg)
-            chat_results.append(chat_result)
-
-        _record_ban_log(target_arg, issuer.id, reason, permanent)
-        overall_results.append(f"Global ban applied for {target_arg}.\n" + "\n".join(chat_results))
-
-    save_data(data)
-    message = "No bans processed." if not overall_results else "\n\n".join(overall_results)
-    message += f"\nReason: {reason}"
-    await ctx.bot.send_message(update.effective_chat.id, message)
-
-
-# global ban command: /globalban <user_id|@username> <reason (optional)>
-async def globalban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    issuer = update.effective_user
-    if not await is_admin_user(issuer.id):
-        await ctx.bot.send_message(update.effective_chat.id, "You are not authorized to run that command.")
-        return
-
-    if not ctx.args:
-        await ctx.bot.send_message(update.effective_chat.id, "Usage: /globalban <user_id or @username> [reason]")
-        return
-
-    target_arg = ctx.args[0]
-    reason = " ".join(ctx.args[1:]) if len(ctx.args) > 1 else "No reason provided"
-    await _ban_targets(update, ctx, [target_arg], reason, permanent=False)
-
-
-async def ban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    issuer = update.effective_user
-    if not await is_admin_user(issuer.id):
-        await ctx.bot.send_message(update.effective_chat.id, "You are not authorized to run that command.")
-        return
-
-    if not ctx.args:
-        await ctx.bot.send_message(update.effective_chat.id, "Usage: /ban <user_id or @username> [reason]")
-        return
-
-    target_arg = ctx.args[0]
-    reason = " ".join(ctx.args[1:]) if len(ctx.args) > 1 else "No reason provided"
-    await _ban_targets(update, ctx, [target_arg], reason, permanent=False)
-
-
-async def mban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    issuer = update.effective_user
-    if not await is_admin_user(issuer.id):
-        await ctx.bot.send_message(update.effective_chat.id, "You are not authorized to run that command.")
-        return
-
-    if not ctx.args:
-        await ctx.bot.send_message(update.effective_chat.id, "Usage: /mban <user_id or @username> [additional targets...] [reason]")
-        return
-
-    targets = []
-    reason_start = None
-    for idx, arg in enumerate(ctx.args):
-        parsed = parse_target_arg(arg)
-        if parsed is None:
-            if targets:
-                reason_start = idx
-                break
-            await ctx.bot.send_message(update.effective_chat.id, "Provide at least one valid user id or @username to ban.")
-            return
-        targets.append(arg)
-    if not targets:
-        await ctx.bot.send_message(update.effective_chat.id, "Provide at least one valid user id or @username to ban.")
-        return
-
-    reason_tokens = ctx.args[reason_start:] if reason_start is not None else []
-    if not reason_tokens and len(ctx.args) > len(targets):
-        reason_tokens = ctx.args[len(targets):]
-
-    reason = " ".join(reason_tokens) if reason_tokens else "No reason provided"
-    await _ban_targets(update, ctx, targets, reason, permanent=False)
-
-
-async def fban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    issuer = update.effective_user
-    if not await is_admin_user(issuer.id):
-        await ctx.bot.send_message(update.effective_chat.id, "You are not authorized to run that command.")
-        return
-
-    if not ctx.args:
-        await ctx.bot.send_message(update.effective_chat.id, "Usage: /fban <user_id or @username> [reason]")
-        return
-
-    target_arg = ctx.args[0]
-    reason = " ".join(ctx.args[1:]) if len(ctx.args) > 1 else "No reason provided"
-    await _ban_targets(update, ctx, [target_arg], reason, permanent=True)
-
-# global unban
-async def globalunban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    issuer = update.effective_user
-    if not await is_admin_user(issuer.id):
-        await ctx.bot.send_message(update.effective_chat.id, "You are not authorized to run that command.")
-        return
-
-    if not ctx.args:
-        await ctx.bot.send_message(update.effective_chat.id, "Usage: /globalunban <user_id or @username>")
-        return
-
-    target_arg = ctx.args[0]
-    entry = _get_global_ban_entry(target_arg)
-    if entry is None:
-        await ctx.bot.send_message(update.effective_chat.id, f"{target_arg} is not in the global ban list.")
-        return
-
-    await _perform_unban(update, ctx, target_arg)
-
-
-async def _perform_unban(update: Update, ctx: ContextTypes.DEFAULT_TYPE, target_arg: str):
-    parsed = parse_target_arg(target_arg)
-    if parsed is None:
-        await ctx.bot.send_message(update.effective_chat.id, f"Could not parse {target_arg} for unban.")
-        return
-
-    entry = _remove_global_ban_entry(target_arg)
-    if entry is None:
-        await ctx.bot.send_message(update.effective_chat.id, f"{target_arg} is not in the global ban list.")
-        return
-
-    save_data(data)
-
-    results = []
-
-    for cid in list(data["managed_chats"]):
-        try:
-            if isinstance(parsed, str) and parsed.startswith("@"):
-                resolved = await _resolve_target_id(ctx, parsed)
-                if resolved is None:
-                    raise ValueError("could not resolve username")
-                uid = resolved
-            else:
-                uid = int(parsed)
-            await ctx.bot.unban_chat_member(cid, uid)
-            results.append(f"{cid}: unbanned.")
-        except Exception as e:
-            results.append(f"{cid}: failed to unban ({e}).")
-
-    await ctx.bot.send_message(update.effective_chat.id, f"Removed {target_arg} from global bans.\nResults:\n" + "\n".join(results))
-
-
-async def unban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    issuer = update.effective_user
-    if not await is_admin_user(issuer.id):
-        await ctx.bot.send_message(update.effective_chat.id, "You are not authorized to run that command.")
-        return
-
-    if len(ctx.args) < 2:
-        await ctx.bot.send_message(update.effective_chat.id, "Usage: /unban <user_id or @username> <reason>")
-        return
-
-    target_arg = ctx.args[0]
-    reason = " ".join(ctx.args[1:])
-    await ctx.bot.send_message(update.effective_chat.id, f"Unban requested for {target_arg}. Reason: {reason}")
-    await _perform_unban(update, ctx, target_arg)
-
-# simple start
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await ctx.bot.send_message(update.effective_chat.id,
-                               "Moderation bot online. Admin commands: /register /unregister /list_managed /ban /mban /fban /unban /stats /protect /help.")
-
-
-async def protect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    issuer = update.effective_user
-    if not await is_admin_user(issuer.id):
-        await ctx.bot.send_message(update.effective_chat.id, "You are not authorized to run that command.")
-        return
-
-    if not ctx.args:
-        await ctx.bot.send_message(update.effective_chat.id, "Usage: /protect <user_id or @username>")
-        return
-
-    target_arg = ctx.args[0]
-    _add_protected(target_arg)
-    save_data(data)
-    await ctx.bot.send_message(update.effective_chat.id, f"Added {target_arg} to protected users.")
-
-
-async def unprotect(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    issuer = update.effective_user
-    if not await is_admin_user(issuer.id):
-        await ctx.bot.send_message(update.effective_chat.id, "You are not authorized to run that command.")
-        return
-
-    if not ctx.args:
-        await ctx.bot.send_message(update.effective_chat.id, "Usage: /unprotect <user_id or @username>")
-        return
-
-    target_arg = ctx.args[0]
-    if _remove_protected(target_arg):
-        save_data(data)
-        await ctx.bot.send_message(update.effective_chat.id, f"Removed {target_arg} from protected users.")
-    else:
-        await ctx.bot.send_message(update.effective_chat.id, f"{target_arg} was not protected.")
-
-
-async def getprotected(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    issuer = update.effective_user
-    if not await is_admin_user(issuer.id):
-        await ctx.bot.send_message(update.effective_chat.id, "You are not authorized to run that command.")
-        return
-
-    if not data["protected_users"]:
-        await ctx.bot.send_message(update.effective_chat.id, "No protected users configured.")
-        return
-
-    lines = [f"{i + 1}. {item}" for i, item in enumerate(data["protected_users"])]
-    await ctx.bot.send_message(update.effective_chat.id, "Protected users:\n" + "\n".join(lines))
-
-
-async def stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    protected_count = len(data["protected_users"])
-    active_channels = len(data["managed_chats"])
+    async with _data_lock:
+        bans = list(data["global_bans"])
+        logs = list(data["ban_logs"])
+        managed_count = len(data["managed_chats"])
     today = datetime.now(timezone.utc).date()
-    banned_today = 0
-    for entry in data["ban_logs"]:
-        if not isinstance(entry, dict):
-            continue
-        entry_date = _date_from_timestamp(entry.get("timestamp"))
-        if entry_date == today:
-            banned_today += 1
-
-    total_blocked = len(data["global_bans"])
-    message = (
-        "🚀 KickBot v2.0.0 | 🔄 Auto-Sync • 🛡️ Protected\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "📊 KICKBOT STATISTICS\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔐 Protected Users: {protected_count}\n"
-        f"📡 Active Channels: {active_channels}\n"
-        f"⛔ Banned Today: {banned_today}\n"
-        f"🚫 Total Blocked: {total_blocked}\n"
+    total_banned = len(bans)
+    total_actions = sum(1 for entry in logs if entry.get("action") == "ban")
+    permanent_bans = sum(1 for entry in logs if entry.get("action") == "ban" and entry.get("permanent"))
+    today_bans = sum(
+        1
+        for entry in logs
+        if entry.get("action") == "ban" and _parse_iso_date(entry.get("timestamp")) == today
     )
-    await ctx.bot.send_message(update.effective_chat.id, message)
+    recent = logs[-5:]
+
+    lines = [
+        "📊 KickBot Statistics",
+        f"• Active managed chats: {managed_count}",
+        f"• Currently banned users: {total_banned}",
+        f"• Total ban actions: {total_actions}",
+        f"• Permanent bans: {permanent_bans}",
+        f"• Bans today: {today_bans}",
+    ]
+    if recent:
+        lines.append("\nRecent actions:")
+        for entry in reversed(recent):
+            timestamp = entry.get("timestamp", "")
+            action = entry.get("action", "ban").upper()
+            reason = entry.get("reason") or "-"
+            lines.append(f"• [{action}] {entry.get('target')} — {reason} ({timestamp})")
+    await ctx.bot.send_message(chat.id, "\n".join(lines))
 
 
-async def getid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def getid(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if not chat:
+        return
+    message = update.effective_message
     if ctx.args:
-        target = ctx.args[0]
-        try:
-            chat_obj = await ctx.bot.get_chat(target)
-            await ctx.bot.send_message(update.effective_chat.id, f"ID for {target}: {chat_obj.id}")
-        except Exception as exc:
-            await ctx.bot.send_message(update.effective_chat.id, f"Failed to resolve {target}: {exc}")
+        identifier = ctx.args[0]
+        if identifier.startswith("@"):
+            try:
+                chat_obj = await ctx.bot.get_chat(identifier)
+                await ctx.bot.send_message(chat.id, f"{identifier} → {chat_obj.id}")
+            except TelegramError as exc:
+                await ctx.bot.send_message(chat.id, f"Failed to resolve {identifier}: {exc}")
+        else:
+            await ctx.bot.send_message(chat.id, f"Provided ID: {identifier}")
         return
-
-    if update.message and update.message.reply_to_message:
-        user = update.message.reply_to_message.from_user
-        await ctx.bot.send_message(update.effective_chat.id, f"Replied user ID: {user.id}")
+    if message and message.reply_to_message and message.reply_to_message.from_user:
+        replied = message.reply_to_message.from_user
+        display = replied.full_name
+        if replied.username:
+            display += f" (@{replied.username})"
+        await ctx.bot.send_message(chat.id, f"{display} → {replied.id}")
         return
+    await ctx.bot.send_message(chat.id, "Usage: /getid @username or reply to a user.")
 
-    await ctx.bot.send_message(update.effective_chat.id, "Usage: /getid <@username or user_id> or reply to a user.")
 
-
-async def roles(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def roles(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    if await is_admin_user(user.id):
-        await ctx.bot.send_message(update.effective_chat.id, "You are a configured Super Admin.")
-    else:
-        await ctx.bot.send_message(update.effective_chat.id, "You have standard user permissions.")
+    chat = update.effective_chat
+    if not user:
+        return
+    if not chat:
+        return
+    role = "Super Admin" if user.id in ADMINS else "User"
+    await ctx.bot.send_message(chat.id, f"You are classified as: {role}")
 
 
-async def help_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    message = (
-        "⚡️ QUICK COMMANDS\n"
-        "🔴 BAN ACTIONS\n"
-        "  └ /ban @user [reason]\n"
-        "  └ /mban id1 id2 [reason]\n"
-        "  └ /fban @user [reason]\n\n"
-        "🟢 UNBAN ACTIONS\n"
-        "  └ /unban @user <reason>\n\n"
-        "🔵 INFO COMMANDS\n"
-        "  └ /help\n  └ /getid @user\n  └ /stats\n  └ /roles\n\n"
-        "🛡️ PROTECTION\n"
-        "  └ /protect @user\n  └ /unprotect @user\n  └ /getprotected\n"
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if not chat:
+        return
+    text = (
+        "🚀 TotalModBot online!\n"
+        "Admins can use /help to view moderation commands.\n"
+        "Register chats with /register and sync bans across every managed group."
     )
-    await ctx.bot.send_message(update.effective_chat.id, message)
+    await ctx.bot.send_message(chat.id, text)
 
-def main():
+
+async def help_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if not chat:
+        return
+    lines = [
+        "🛡️ KickBot-style Command Reference",
+        "\nBan actions:",
+        "• /ban <user> [reason]",
+        "• /fban <user> [reason]",
+        "• /mban <user1> <user2> [...] -- <reason>",
+        "• /unban <user> <reason>",
+        "• /globalunban <user> [reason]",
+        "\nProtection:",
+        "• /protect <user>",
+        "• /unprotect <user>",
+        "• /getprotected",
+        "\nManagement:",
+        "• /register /unregister",
+        "• /list_managed",
+        "• /stats",
+        "\nUtilities:",
+        "• /getid [@user]",
+        "• /roles",
+    ]
+    await ctx.bot.send_message(chat.id, "\n".join(lines))
+
+
+def main() -> None:
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("register", register))
     app.add_handler(CommandHandler("unregister", unregister))
     app.add_handler(CommandHandler("list_managed", list_managed))
-    app.add_handler(CommandHandler("globalban", globalban))
-    app.add_handler(CommandHandler("globalunban", globalunban))
-    app.add_handler(CommandHandler("ban", ban))
-    app.add_handler(CommandHandler("mban", mban))
+    app.add_handler(CommandHandler(["ban", "globalban"], ban))
     app.add_handler(CommandHandler("fban", fban))
+    app.add_handler(CommandHandler("mban", mban))
     app.add_handler(CommandHandler("unban", unban))
+    app.add_handler(CommandHandler("globalunban", globalunban))
     app.add_handler(CommandHandler("protect", protect))
     app.add_handler(CommandHandler("unprotect", unprotect))
-    app.add_handler(CommandHandler("getprotected", getprotected))
+    app.add_handler(CommandHandler("getprotected", get_protected))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("getid", getid))
     app.add_handler(CommandHandler("roles", roles))
-    app.add_handler(CommandHandler("help", help_command))
 
-    print("Bot starting...")
+    logger.info("Starting TotalModBot polling loop...")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
