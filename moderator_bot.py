@@ -660,6 +660,7 @@ async def stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         bans = list(data["global_bans"])
         logs = list(data["ban_logs"])
         managed_count = len(data["managed_chats"])
+        protected_count = len(data["protected_users"])
     today = datetime.now(timezone.utc).date()
     total_banned = len(bans)
     total_actions = sum(1 for entry in logs if entry.get("action") == "ban")
@@ -675,6 +676,7 @@ async def stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "📊 KickBot Statistics",
         f"• Active managed chats: {managed_count}",
         f"• Currently banned users: {total_banned}",
+        f"• Protected users: {protected_count}",
         f"• Total ban actions: {total_actions}",
         f"• Permanent bans: {permanent_bans}",
         f"• Bans today: {today_bans}",

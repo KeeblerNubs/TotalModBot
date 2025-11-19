@@ -6,9 +6,11 @@ TotalModBot is a Telegram moderation assistant that keeps a shared global ban li
 
 - Register and unregister chats that should receive synchronized bans.
 - Apply single, forced, or bulk bans that propagate to every managed chat.
-- Maintain a protected list of users who should never be banned.
-- Log ban activity for permanent bans, daily counts, and quick statistics.
+- Maintain a protected list of users who should never be banned, even when mass banning.
+- Log every ban and unban with issuer, reason, permanence flag, and timestamp so statistics stay accurate.
 - Look up user IDs, review protected entries, and confirm your access level.
+
+Moderation state is stored in a JSON file (`DATA_FILE`) that captures managed chat IDs, protected users, a detailed global ban ledger, and a rolling audit log of ban actions for stats.
 
 ## Getting started
 
