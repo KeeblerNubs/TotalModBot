@@ -1,0 +1,46 @@
+#! moderator-bot-deployment.yaml
+# Generated code, do not edit
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+    name: moderator-bot
+    namespace: totalmodbot
+    labels:
+        com.docker.compose.project: totalmodbot
+        com.docker.compose.service: moderator-bot
+spec:
+    replicas: 1
+    selector:
+        matchLabels:
+            com.docker.compose.project: totalmodbot
+            com.docker.compose.service: moderator-bot
+    strategy:
+        type: Recreate
+    template:
+        metadata:
+            labels:
+                com.docker.compose.project: totalmodbot
+                com.docker.compose.service: moderator-bot
+                com.docker.compose.network.default: "true"
+        spec:
+            restartPolicy: unless-stopped
+            containers:
+                - name: moderator-bot
+                  image: totalmodbot-moderator-bot
+                  imagePullPolicy: IfNotPresent
+                  env:
+                    - name: ADMINS
+                      value: "8067293930"
+                    - name: BOT_TOKEN
+                      value: "8446535005:AAEdmQveWy77vLzUjxfv8j-mKFCcE1C6Ey0"
+                    - name: DATA_DIR
+                      value: "/app/data"
+                    - name: LOG_LEVEL
+                      value: "INFO"
+                  volumeMounts:
+                    - name: app-data
+                      mountPath: /app/data
+            volumes:
+                - name: app-data
+                  persistentVolumeClaim:
+                    claimName: moderator-bot-bot-data

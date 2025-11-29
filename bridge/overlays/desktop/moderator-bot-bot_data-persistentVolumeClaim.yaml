@@ -1,0 +1,9 @@
+#! moderator-bot-bot_data-persistentVolumeClaim.yaml
+# Generated code, do not edit
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+    name: moderator-bot-bot-data
+    namespace: totalmodbot
+spec:
+    storageClassName: "hostpath" # see docker/desktop-storage-provisioner

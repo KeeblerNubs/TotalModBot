@@ -1,0 +1,18 @@
+#! moderator-bot-bot_data-persistentVolumeClaim.yaml
+# Generated code, do not edit
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+    name: moderator-bot-bot-data
+    namespace: totalmodbot
+    labels:
+        com.docker.compose.service: moderator-bot
+        com.docker.compose.volume: bot_data
+spec:
+    accessModes:
+        # TODO would need to check which services use this volume
+        - ReadWriteOnce
+    volumeMode: Filesystem
+    resources:
+        requests:
+            storage: 100Mi
