@@ -2,7 +2,16 @@
 
 TotalModBot is a Telegram moderation assistant that keeps a shared global ban list across every registered chat. It ships with KickBot-style commands for quickly banning raiders, safeguarding trusted members, and reviewing moderation statistics.
 
-## Features
+## Commands
+
+- `/register` – mark the current chat as managed so it receives global ban updates.
+- `/unregister` – remove the current chat from the managed list.
+- `/ban` – ban a user from the current chat (reply to a message or pass a username/user ID and optional reason).
+- `/globalban` – add a user to the shared global ban list and attempt to ban them from all managed chats.
+- `/globalunban` – remove a user from the shared global ban list and unban them from managed chats where possible.
+- `/list_managed` – show the chats currently registered with the bot.
+
+## Prerequisites
 
 - Register and unregister chats that should receive synchronized bans.
 - Apply single, forced, or bulk bans that propagate to every managed chat.
