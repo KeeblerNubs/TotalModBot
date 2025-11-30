@@ -37,6 +37,8 @@ Moderation state is stored in a JSON file (`DATA_FILE`) that captures managed ch
 
    Logs are available with `docker compose logs -f`.
 
+5. **On Windows 10 + WSL2 + Docker Desktop**, follow the quick-start steps and troubleshooting notes in [HYBRID_AUTOMATION.md](HYBRID_AUTOMATION.md#windows-10--docker-quick-start) to avoid path and permissions issues.
+
 ## Persistent storage
 
 Moderation state (managed chat IDs, ban ledger, protected users, and action logs) is stored in `DATA_FILE`. When running with Docker Compose, the file lives in the `bot_data` named volume so that state survives container restarts. Remove the data by running `docker compose down --volumes`.
@@ -65,5 +67,7 @@ Moderation state (managed chat IDs, ban ledger, protected users, and action logs
 - Commands that modify moderation state require the caller to be listed in `ADMINS`.
 - Bans are best-effort: the bot must be an administrator with the right to restrict members in each managed chat.
 - Protected users cannot be banned until removed from the protected list.
+
+For an overview of hybrid userbots, Bot API bots, and full userbots—and when to use each—see [HYBRID_AUTOMATION.md](HYBRID_AUTOMATION.md).
 
 Enjoy cleaner chats! 🙌
