@@ -44,7 +44,23 @@ Moderation state is stored in a JSON file (`DATA_FILE`) that captures managed ch
    docker compose up --build -d
    ```
 
-   Logs are available with `docker compose logs -f`.
+Logs are available with `docker compose logs -f`.
+
+## Kubernetes deployment
+
+The `bridge/base` and `bridge/overlays/desktop` manifests mirror the Compose setup
+for clusters that support Kustomize. Before applying them, replace the placeholder
+`ADMINS` and `BOT_TOKEN` values in `bridge/base/moderator-bot-deployment.yaml` with
+your own IDs and bot token. Then deploy with:
+
+```bash
+kubectl apply -k bridge/base
+# Or for Docker Desktop's built-in Kubernetes:
+kubectl apply -k bridge/overlays/desktop
+```
+
+Persistent data is stored in the `moderator-bot-bot-data` PVC. To reset state,
+delete the claim and the deployment.
 
 5. **On Windows 10 + WSL2 + Docker Desktop**, follow the quick-start steps and troubleshooting notes in [HYBRID_AUTOMATION.md](HYBRID_AUTOMATION.md#windows-10--docker-quick-start) to avoid path and permissions issues.
 

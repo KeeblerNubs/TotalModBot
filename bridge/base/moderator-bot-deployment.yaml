@@ -30,9 +30,9 @@ spec:
                   imagePullPolicy: IfNotPresent
                   env:
                     - name: ADMINS
-                      value: "8067293930"
+                      value: "<SET_ADMIN_IDS>"
                     - name: BOT_TOKEN
-                      value: "8446535005:AAEdmQveWy77vLzUjxfv8j-mKFCcE1C6Ey0"
+                      value: "<SET_BOT_TOKEN>"
                     - name: DATA_DIR
                       value: "/app/data"
                     - name: LOG_LEVEL
