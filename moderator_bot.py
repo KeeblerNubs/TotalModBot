@@ -12,7 +12,13 @@ from typing import Any, Optional
 
 from telegram import Update
 from telegram.error import TelegramError
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 # ---------- CONFIG ----------
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "<PUT_YOUR_TOKEN_HERE>")
@@ -20,6 +26,8 @@ DEFAULT_ADMINS = {123456789}
 DATA_DIR = os.environ.get("DATA_DIR", os.path.join(os.getcwd(), "data"))
 DATA_FILE = os.environ.get("DATA_FILE", os.path.join(DATA_DIR, "mod_data.json"))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+ADMIN_LOG_CHAT_ID = os.environ.get("ADMIN_LOG_CHAT_ID")
+BANNED_WORDS = os.environ.get("BANNED_WORDS", "")
 # ----------------------------
 
 os.makedirs(os.path.dirname(DATA_FILE) or ".", exist_ok=True)
@@ -75,6 +83,7 @@ def _utcnow_iso() -> str:
 
 def _ensure_schema(raw: Optional[dict[str, Any]]) -> dict[str, Any]:
     base: dict[str, Any] = raw or {}
+    env_banned_words = [_normalize_key(word) for word in BANNED_WORDS.replace(";", ",").split(",") if word.strip()]
     managed = base.get("managed_chats", [])
     if not isinstance(managed, list):
         managed = []
@@ -157,6 +166,18 @@ def _ensure_schema(raw: Optional[dict[str, Any]]) -> dict[str, Any]:
             }
         )
     base["ban_logs"] = cleaned_logs
+
+    banned_words = base.get("banned_words", env_banned_words)
+    if not isinstance(banned_words, list):
+        banned_words = env_banned_words
+    cleaned_words: list[str] = []
+    for word in banned_words:
+        if not isinstance(word, str):
+            continue
+        normalized = _normalize_key(word)
+        if normalized and normalized not in cleaned_words:
+            cleaned_words.append(normalized)
+    base["banned_words"] = cleaned_words
     return base
 
 
@@ -226,6 +247,54 @@ def _extract_reason(
     return reason
 
 
+def _normalize_word(word: str) -> str:
+    return _normalize_key(word)
+
+
+async def _add_banned_word(entry: str) -> tuple[bool, str]:
+    normalized = _normalize_word(entry)
+    if not normalized:
+        return False, "No banned word provided."
+    async with _data_lock:
+        if normalized in data["banned_words"]:
+            return False, f"'{entry}' is already in the banned words list."
+        data["banned_words"].append(normalized)
+        save_data(data)
+    return True, f"Added '{normalized}' to the banned words list."
+
+
+async def _remove_banned_word(entry: str) -> tuple[bool, str]:
+    normalized = _normalize_word(entry)
+    async with _data_lock:
+        if normalized not in data["banned_words"]:
+            return False, f"'{entry}' is not in the banned words list."
+        data["banned_words"].remove(normalized)
+        save_data(data)
+    return True, f"Removed '{normalized}' from the banned words list."
+
+
+def _parse_chat_id(value: Optional[str]) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        logger.warning("Invalid ADMIN_LOG_CHAT_ID provided; logging to admin channel disabled.")
+        return None
+
+
+ADMIN_LOG_CHAT_ID_VALUE = _parse_chat_id(ADMIN_LOG_CHAT_ID)
+
+
+async def _notify_admin_channel(ctx: ContextTypes.DEFAULT_TYPE, message: str) -> None:
+    if ADMIN_LOG_CHAT_ID_VALUE is None:
+        return
+    try:
+        await ctx.bot.send_message(ADMIN_LOG_CHAT_ID_VALUE, message)
+    except TelegramError as exc:
+        logger.warning("Failed to send admin log message: %s", exc)
+
+
 def admin_only(handler):
     @wraps(handler)
     async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
@@ -237,6 +306,48 @@ def admin_only(handler):
             return
         return await handler(update, ctx, *args, **kwargs)
     return wrapper
+
+
+@admin_only
+async def addbannedword(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if not chat:
+        return
+    if not ctx.args:
+        await ctx.bot.send_message(chat.id, "Usage: /addbannedword <word>")
+        return
+    success, message = await _add_banned_word(" ".join(ctx.args))
+    await ctx.bot.send_message(chat.id, message)
+    if success:
+        await _notify_admin_channel(ctx, f"🛑 Banned word added by {update.effective_user.id if update.effective_user else 'unknown'}: {message}")
+
+
+@admin_only
+async def removebannedword(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if not chat:
+        return
+    if not ctx.args:
+        await ctx.bot.send_message(chat.id, "Usage: /removebannedword <word>")
+        return
+    success, message = await _remove_banned_word(" ".join(ctx.args))
+    await ctx.bot.send_message(chat.id, message)
+    if success:
+        await _notify_admin_channel(ctx, f"⚠️ Banned word removed by {update.effective_user.id if update.effective_user else 'unknown'}: {message}")
+
+
+@admin_only
+async def listbannedwords(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if not chat:
+        return
+    async with _data_lock:
+        banned_words = list(data["banned_words"])
+    if not banned_words:
+        await ctx.bot.send_message(chat.id, "No banned words are configured.")
+        return
+    lines = [f"• {word}" for word in sorted(banned_words)]
+    await ctx.bot.send_message(chat.id, "Banned words:\n" + "\n".join(lines))
 
 
 async def _resolve_target_from_args(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Optional[Target]:
@@ -399,6 +510,61 @@ async def _handle_single_ban(
     summary_lines.append("")
     summary_lines.extend(results)
     return "\n".join(summary_lines)
+
+
+async def _auto_ban_for_words(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+
+    if not message or not chat or not user or user.is_bot:
+        return
+
+    content_parts = []
+    if message.text:
+        content_parts.append(message.text)
+    if message.caption:
+        content_parts.append(message.caption)
+
+    combined_text = " ".join(part for part in content_parts if part).strip()
+    if not combined_text:
+        return
+
+    lowered_text = combined_text.lower()
+    async with _data_lock:
+        banned_words = list(data["banned_words"])
+        chat_is_managed = chat.id in data["managed_chats"]
+
+    matched_words = sorted({word for word in banned_words if word and word in lowered_text})
+    if not matched_words or _is_protected(user.id) or user.id in ADMINS:
+        return
+
+    if not chat_is_managed:
+        try:
+            await ctx.bot.ban_chat_member(chat.id, user.id)
+        except TelegramError as exc:
+            logger.warning("Failed to ban user %s in chat %s for banned words: %s", user.id, chat.id, exc)
+
+    target = Target(raw=str(user.id), user_id=user.id, label=f"{user.full_name} ({user.id})")
+    reason = f"Banned for banned word(s): {', '.join(matched_words)}"
+    ban_summary = await _handle_single_ban(
+        update,
+        ctx,
+        target=target,
+        issuer_id=0,
+        reason=reason,
+        permanent=False,
+    )
+    await ctx.bot.send_message(chat.id, ban_summary)
+
+    admin_log_message = (
+        "🚫 Auto-ban triggered by banned words\n"
+        f"Chat: {chat.title or chat.id} ({chat.id})\n"
+        f"User: {user.full_name} (@{user.username or '-'} | {user.id})\n"
+        f"Matched: {', '.join(matched_words)}\n"
+        f"Message: {combined_text}"
+    )
+    await _notify_admin_channel(ctx, admin_log_message)
 
 
 @admin_only
@@ -805,6 +971,9 @@ async def help_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "/protect <user> — Prevent a user from being banned globally.",
         "/unprotect <user> — Remove a user from the protected list.",
         "/getprotected — List protected users.",
+        "/addbannedword <word> — Add a word to the OCR auto-ban list.",
+        "/removebannedword <word> — Remove a word from the OCR auto-ban list.",
+        "/listbannedwords — Show all OCR auto-ban words.",
         "/stats — Show bot statistics.",
         "/getid — Resolve a user's ID (reply or provide @username/ID).",
         "/roles — Show your access level.",
@@ -838,9 +1007,14 @@ def main():
     app.add_handler(CommandHandler("protect", protect))
     app.add_handler(CommandHandler("unprotect", unprotect))
     app.add_handler(CommandHandler("getprotected", get_protected))
+    app.add_handler(CommandHandler("addbannedword", addbannedword))
+    app.add_handler(CommandHandler("removebannedword", removebannedword))
+    app.add_handler(CommandHandler("listbannedwords", listbannedwords))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("getid", getid))
     app.add_handler(CommandHandler("roles", roles))
+
+    app.add_handler(MessageHandler(~filters.COMMAND, _auto_ban_for_words))
 
     logger.info("Starting TotalModBot polling loop...")
     app.run_polling()
