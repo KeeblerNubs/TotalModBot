@@ -444,12 +444,12 @@ async def list_managed(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 @admin_only
-async def ban(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def globalban(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
     if not chat:
         return
     if not ctx.args and not (update.effective_message and update.effective_message.reply_to_message):
-        await ctx.bot.send_message(chat.id, "Usage: /ban <user_id|@username> [reason]")
+        await ctx.bot.send_message(chat.id, "Usage: /globalban <user_id|@username> [reason]")
         return
     target = await _resolve_target_from_args(update, ctx)
     if not target:
@@ -461,14 +461,11 @@ async def ban(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ctx.bot.send_message(chat.id, message)
 
 
-async def ban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+@admin_only
+async def ban(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     issuer = update.effective_user
     chat = update.effective_chat
-
-    if not await is_admin_user(issuer.id):
-        await ctx.bot.send_message(chat.id, "You do not have permission to use /ban.")
-        return
 
     target_id = None
     target_label = None
@@ -826,27 +823,6 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "Register chats with /register and sync bans across every managed group."
     )
     await ctx.bot.send_message(chat.id, text)
-
-
-    results = []
-    for cid in list(data["managed_chats"]):
-        try:
-            if target_arg.startswith("@"):
-                member = await ctx.bot.get_chat_member(cid, target_arg)
-                uid = member.user.id
-            else:
-                uid = int(target_arg)
-            await ctx.bot.unban_chat_member(cid, uid)
-            results.append(f"{cid}: unbanned.")
-        except Exception as e:
-            results.append(f"{cid}: failed to unban ({e}).")
-
-    await ctx.bot.send_message(update.effective_chat.id, f"Removed {target_arg} from global bans.\nResults:\n" + "\n".join(results))
-
-# simple start
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await ctx.bot.send_message(update.effective_chat.id,
-                               "Moderation bot online. Admin commands: /register /unregister /ban /globalban /globalunban /list_managed.")
 
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
