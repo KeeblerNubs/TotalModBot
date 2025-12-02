@@ -791,6 +791,31 @@ async def roles(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ctx.bot.send_message(chat.id, f"You are classified as: {role}")
 
 
+async def help_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    if not chat:
+        return
+
+    lines = [
+        "🛡️ Moderation commands:",
+        "/register — Register this chat for global ban propagation.",
+        "/unregister — Remove this chat from global ban propagation.",
+        "/list_managed — Show chats currently registered.",
+        "/ban <user> <reason> — Ban a user in the current chat.",
+        "/unban <user> <reason> — Unban a user in the current chat.",
+        "/globalban <user> <reason> — Ban a user across all managed chats.",
+        "/globalunban <user> [reason] — Remove a global ban.",
+        "/protect <user> — Prevent a user from being banned globally.",
+        "/unprotect <user> — Remove a user from the protected list.",
+        "/getprotected — List protected users.",
+        "/stats — Show bot statistics.",
+        "/getid — Resolve a user's ID (reply or provide @username/ID).",
+        "/roles — Show your access level.",
+    ]
+
+    await ctx.bot.send_message(chat.id, "\n".join(lines))
+
+
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
     if not chat:
