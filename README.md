@@ -10,6 +10,7 @@ TotalModBot is a Telegram moderation assistant that keeps a shared global ban li
 - `/globalban` – add a user to the shared global ban list and attempt to ban them from all managed chats.
 - `/globalunban` – remove a user from the shared global ban list and unban them from managed chats where possible.
 - `/list_managed` – show the chats currently registered with the bot.
+- `/addbannedword` / `/removebannedword` / `/listbannedwords` – manage OCR-triggered auto-ban keywords.
 
 ## Prerequisites
 
@@ -28,6 +29,8 @@ Moderation state is stored in a JSON file (`DATA_FILE`) that captures managed ch
 3. **Set** the following environment variables:
    - `BOT_TOKEN` – required bot token.
    - `ADMINS` – comma or semicolon separated list of Telegram user IDs allowed to run admin commands. Defaults to `123456789`.
+   - `ADMIN_LOG_CHAT_ID` – optional chat/channel ID that should receive audit notifications when bans happen automatically.
+   - `BANNED_WORDS` – optional comma/semicolon separated list of words to seed the OCR auto-ban list.
    - Optional overrides: `LOG_LEVEL`, `DATA_DIR`, `DATA_FILE`.
 4. **Install dependencies** and launch the bot:
 
@@ -83,6 +86,7 @@ Moderation state (managed chat IDs, ban ledger, protected users, and action logs
 | `/globalunban` | Legacy alias for `/unban` that allows an optional reason. |
 | `/protect` / `/unprotect` | Manage the protected allow-list. |
 | `/getprotected` | Display all protected users. |
+| `/addbannedword` / `/removebannedword` / `/listbannedwords` | Manage the OCR auto-ban word list. |
 | `/stats` | Show KickBot-style moderation statistics and recent actions. |
 | `/getid` | Resolve a Telegram ID from a username or replied message. |
 | `/roles` | Reveal whether you are configured as a Super Admin. |
@@ -92,6 +96,7 @@ Moderation state (managed chat IDs, ban ledger, protected users, and action logs
 - Commands that modify moderation state require the caller to be listed in `ADMINS`.
 - Bans are best-effort: the bot must be an administrator with the right to restrict members in each managed chat.
 - Protected users cannot be banned until removed from the protected list.
+- OCR-flagged messages that contain words from the banned list trigger automatic bans and optional admin-channel alerts when `ADMIN_LOG_CHAT_ID` is set.
 
 For an overview of hybrid userbots, Bot API bots, and full userbots—and when to use each—see [HYBRID_AUTOMATION.md](HYBRID_AUTOMATION.md).
 
