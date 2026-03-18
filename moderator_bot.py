@@ -10,10 +10,11 @@ from datetime import date, datetime, timezone
 from functools import wraps
 from typing import Any, Optional
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import TelegramError
 from telegram.ext import (
     ApplicationBuilder,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -954,6 +955,107 @@ async def roles(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ctx.bot.send_message(chat.id, f"You are classified as: {role}")
 
 
+def _build_dashboard_keyboard(user_id: Optional[int]) -> InlineKeyboardMarkup:
+    is_admin = user_id in ADMINS if user_id is not None else False
+    rows = [
+        [
+            InlineKeyboardButton("ℹ️ Help", callback_data="dashboard:help"),
+            InlineKeyboardButton("🪪 My Role", callback_data="dashboard:roles"),
+        ],
+        [
+            InlineKeyboardButton("🆔 Get ID Guide", callback_data="dashboard:getid"),
+        ],
+    ]
+    if is_admin:
+        rows.extend(
+            [
+                [
+                    InlineKeyboardButton("📊 Stats", callback_data="dashboard:stats"),
+                    InlineKeyboardButton("📁 Managed Chats", callback_data="dashboard:list_managed"),
+                ],
+                [
+                    InlineKeyboardButton("🛡️ Protected", callback_data="dashboard:getprotected"),
+                    InlineKeyboardButton("🛑 Banned Words", callback_data="dashboard:listbannedwords"),
+                ],
+                [
+                    InlineKeyboardButton("⚙️ Admin Shortcuts", callback_data="dashboard:admin_shortcuts"),
+                ],
+            ]
+        )
+    return InlineKeyboardMarkup(rows)
+
+
+async def dashboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
+    user = update.effective_user
+    if not chat:
+        return
+
+    is_admin = user.id in ADMINS if user else False
+    text = (
+        "🧭 *TotalModBot Dashboard*\n"
+        "Use the menu below for quick actions.\n"
+        "• User controls are available to everyone.\n"
+        "• Admin controls appear only for Super Admins."
+    )
+    if is_admin:
+        text += "\n\n✅ Admin panel enabled."
+    else:
+        text += "\n\n👤 User panel enabled."
+
+    await ctx.bot.send_message(
+        chat.id,
+        text,
+        reply_markup=_build_dashboard_keyboard(user.id if user else None),
+        parse_mode="Markdown",
+    )
+
+
+async def dashboard_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    if not query or not user:
+        return
+
+    await query.answer()
+    payload = (query.data or "").replace("dashboard:", "", 1)
+
+    if payload == "help":
+        await help_command(update, ctx)
+        return
+    if payload == "roles":
+        await roles(update, ctx)
+        return
+    if payload == "getid":
+        await query.answer(
+            "Reply to a message and run /getid, or use /getid @username.",
+            show_alert=True,
+        )
+        return
+
+    if user.id not in ADMINS:
+        await query.answer("Admin controls are only available to Super Admins.", show_alert=True)
+        return
+
+    if payload == "stats":
+        await stats(update, ctx)
+        return
+    if payload == "list_managed":
+        await list_managed(update, ctx)
+        return
+    if payload == "getprotected":
+        await get_protected(update, ctx)
+        return
+    if payload == "listbannedwords":
+        await listbannedwords(update, ctx)
+        return
+    if payload == "admin_shortcuts":
+        await query.answer(
+            "Use: /globalban, /unban, /protect, /addbannedword for direct admin actions.",
+            show_alert=True,
+        )
+
+
 async def help_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     chat = update.effective_chat
     if not chat:
@@ -977,6 +1079,7 @@ async def help_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "/stats — Show bot statistics.",
         "/getid — Resolve a user's ID (reply or provide @username/ID).",
         "/roles — Show your access level.",
+        "/dashboard — Open quick user/admin control menu.",
     ]
 
     await ctx.bot.send_message(chat.id, "\n".join(lines))
@@ -989,7 +1092,8 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "🚀 TotalModBot online!\n"
         "Admins can use /help to view moderation commands.\n"
-        "Register chats with /register and sync bans across every managed group."
+        "Register chats with /register and sync bans across every managed group.\n"
+        "Open /dashboard for quick user and admin controls."
     )
     await ctx.bot.send_message(chat.id, text)
 
@@ -1013,6 +1117,8 @@ def main():
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("getid", getid))
     app.add_handler(CommandHandler("roles", roles))
+    app.add_handler(CommandHandler("dashboard", dashboard))
+    app.add_handler(CallbackQueryHandler(dashboard_callback, pattern=r"^dashboard:"))
 
     app.add_handler(MessageHandler(~filters.COMMAND, _auto_ban_for_words))
 
